@@ -34,6 +34,9 @@ def get_pull_request_info(commit_hash, repository="saleor/saleor-dashboard"):
     Retrieves information about pull requests associated with a given commit hash
     from a GitHub repository, including PR body, number, author and co-authors.
 
+    This function tries multiple approaches to find the ORIGINAL PR where the change
+    was introduced, not just release PRs that bundle multiple changes.
+
     Args:
         commit_hash (str): The Git commit hash to search for.
         repository (str): The GitHub repository in format "owner/repo".
@@ -42,9 +45,6 @@ def get_pull_request_info(commit_hash, repository="saleor/saleor-dashboard"):
         dict: A dictionary containing PR info, or None if not found.
     """
     token = get_github_token()
-
-    # Use the commits/SHA/pulls endpoint to find PRs associated with this commit
-    pr_url = f"https://api.github.com/repos/{repository}/commits/{commit_hash}/pulls"
     headers = {
         "Authorization": f"token {token}",
         "Accept": "application/vnd.github.v3+json",
@@ -64,8 +64,12 @@ def get_pull_request_info(commit_hash, repository="saleor/saleor-dashboard"):
 
         # Extract commit author - prefer GitHub username if available
         commit_author_login = commit_data.get("author", {}).get("login")
-        commit_author_name = commit_data.get("commit", {}).get("author", {}).get("name", "Unknown")
-        commit_author = f"@{commit_author_login}" if commit_author_login else commit_author_name
+        commit_author_name = (
+            commit_data.get("commit", {}).get("author", {}).get("name", "Unknown")
+        )
+        commit_author = (
+            f"@{commit_author_login}" if commit_author_login else commit_author_name
+        )
 
         commit_message = commit_data.get("commit", {}).get("message", "")
 
@@ -81,7 +85,7 @@ def get_pull_request_info(commit_hash, repository="saleor/saleor-dashboard"):
 
                 # Try to find GitHub username from email or use name with @ if it looks like a username
                 if "@github.com" in co_author_email:
-                    username = co_author_email.split('@')[0]
+                    username = co_author_email.split("@")[0]
                     co_authors.append(f"@{username}")
                 elif co_author_name and not any(c in co_author_name for c in " .,"):
                     # If name doesn't contain spaces or punctuation, it might be a username
@@ -89,12 +93,52 @@ def get_pull_request_info(commit_hash, repository="saleor/saleor-dashboard"):
                 else:
                     co_authors.append(co_author_name)
 
-        # Now get pull request information
-        response = requests.get(pr_url, headers=headers)
+        # Strategy 1: Look for PR reference in commit message first (most reliable for original PRs)
+        pr_match = re.search(r"#(\d+)", commit_message)
+        if pr_match:
+            pr_number = pr_match.group(1)
+            print(f"Found PR reference #{pr_number} in commit message")
+
+            detailed_pr_url = (
+                f"https://api.github.com/repos/{repository}/pulls/{pr_number}"
+            )
+            detailed_pr_response = requests.get(detailed_pr_url, headers=headers)
+
+            if detailed_pr_response.status_code == 200:
+                detailed_pr_data = detailed_pr_response.json()
+                pr_body = detailed_pr_data.get("body", "")
+
+                # Get PR author's GitHub username with @ prefix
+                pr_author_login = detailed_pr_data.get("user", {}).get("login")
+                pr_author = f"@{pr_author_login}" if pr_author_login else "Unknown"
+
+                return {
+                    "pr_number": pr_number,
+                    "pr_body": pr_body,
+                    "pr_author": pr_author,
+                    "commit_author": commit_author,
+                    "co_authors": co_authors,
+                }
+
+        # Strategy 2: Use GitHub search API to find PRs that mention this commit
+        print(f"Searching for PRs that mention commit {commit_hash}...")
+        search_url = f"https://api.github.com/search/issues"
+        search_params = {
+            "q": f"repo:{repository} type:pr {commit_hash}",
+            "sort": "created",
+            "order": "asc",  # Get the earliest PR (likely the original)
+        }
+
+        search_response = requests.get(
+            search_url, headers=headers, params=search_params
+        )
 
         # Handle rate limiting
-        if response.status_code == 403 and "rate limit" in response.text.lower():
-            reset_time = int(response.headers.get('X-RateLimit-Reset', 0))
+        if (
+            search_response.status_code == 403
+            and "rate limit" in search_response.text.lower()
+        ):
+            reset_time = int(search_response.headers.get("X-RateLimit-Reset", 0))
             wait_time = max(0, reset_time - int(time.time()))
             if wait_time > 0:
                 print(f"Rate limit exceeded. Waiting for {wait_time} seconds...")
@@ -102,12 +146,105 @@ def get_pull_request_info(commit_hash, repository="saleor/saleor-dashboard"):
                 # Retry the request
                 return get_pull_request_info(commit_hash, repository)
 
-        response.raise_for_status()  # Raise HTTPError for other bad responses (4xx or 5xx)
+        if search_response.status_code == 200:
+            search_data = search_response.json()
+
+            if search_data.get("items"):
+                # Filter out release PRs (they typically have "release" or "changeset" in title)
+                original_prs = []
+                for item in search_data["items"]:
+                    title = item.get("title", "").lower()
+                    # Skip PRs that look like release PRs
+                    if not any(
+                        keyword in title
+                        for keyword in [
+                            "release",
+                            "changeset",
+                            "version bump",
+                            "bump version",
+                        ]
+                    ):
+                        original_prs.append(item)
+
+                if original_prs:
+                    # Take the first non-release PR (earliest created)
+                    pr_item = original_prs[0]
+                    pr_number = str(pr_item["number"])
+
+                    # Get full PR details
+                    detailed_pr_url = (
+                        f"https://api.github.com/repos/{repository}/pulls/{pr_number}"
+                    )
+                    detailed_pr_response = requests.get(
+                        detailed_pr_url, headers=headers
+                    )
+
+                    if detailed_pr_response.status_code == 200:
+                        detailed_pr_data = detailed_pr_response.json()
+                        pr_body = detailed_pr_data.get("body", "")
+
+                        # Get PR author's GitHub username with @ prefix
+                        pr_author_login = detailed_pr_data.get("user", {}).get("login")
+                        pr_author = (
+                            f"@{pr_author_login}" if pr_author_login else "Unknown"
+                        )
+
+                        print(
+                            f"Found original PR #{pr_number} via search: {detailed_pr_data.get('title', '')}"
+                        )
+
+                        return {
+                            "pr_number": pr_number,
+                            "pr_body": pr_body,
+                            "pr_author": pr_author,
+                            "commit_author": commit_author,
+                            "co_authors": co_authors,
+                        }
+
+        # Strategy 3: Fallback to the original approach (commits/SHA/pulls endpoint)
+        print(f"Falling back to commits/pulls endpoint for {commit_hash}...")
+        pr_url = (
+            f"https://api.github.com/repos/{repository}/commits/{commit_hash}/pulls"
+        )
+        response = requests.get(pr_url, headers=headers)
+
+        # Handle rate limiting
+        if response.status_code == 403 and "rate limit" in response.text.lower():
+            reset_time = int(response.headers.get("X-RateLimit-Reset", 0))
+            wait_time = max(0, reset_time - int(time.time()))
+            if wait_time > 0:
+                print(f"Rate limit exceeded. Waiting for {wait_time} seconds...")
+                time.sleep(wait_time)
+                # Retry the request
+                return get_pull_request_info(commit_hash, repository)
+
+        response.raise_for_status()
         pulls_data = response.json()
 
         if pulls_data and len(pulls_data) > 0:
-            # Get the first PR associated with this commit
-            pr_data = pulls_data[0]
+            # Filter out release PRs here too
+            original_prs = []
+            for pr_data in pulls_data:
+                title = pr_data.get("title", "").lower()
+                # Skip PRs that look like release PRs
+                if not any(
+                    keyword in title
+                    for keyword in [
+                        "release",
+                        "changeset",
+                        "version bump",
+                        "bump version",
+                    ]
+                ):
+                    original_prs.append(pr_data)
+
+            if original_prs:
+                # Get the first non-release PR
+                pr_data = original_prs[0]
+            else:
+                # If all PRs are release PRs, take the first one as fallback
+                pr_data = pulls_data[0]
+
             pr_number = pr_data["number"]
             pr_body = pr_data["body"] or ""
 
@@ -120,41 +257,17 @@ def get_pull_request_info(commit_hash, repository="saleor/saleor-dashboard"):
                 "pr_body": pr_body,
                 "pr_author": pr_author,
                 "commit_author": commit_author,
-                "co_authors": co_authors
+                "co_authors": co_authors,
             }
-        else:
-            # Try an alternate approach: look for PR in the commit message
-            pr_match = re.search(r"#(\d+)", commit_message)
 
-            if pr_match:
-                pr_number = pr_match.group(1)
-                detailed_pr_url = f"https://api.github.com/repos/{repository}/pulls/{pr_number}"
-                detailed_pr_response = requests.get(detailed_pr_url, headers=headers)
-
-                if detailed_pr_response.status_code == 200:
-                    detailed_pr_data = detailed_pr_response.json()
-                    pr_body = detailed_pr_data.get("body", "")
-
-                    # Get PR author's GitHub username with @ prefix
-                    pr_author_login = detailed_pr_data.get("user", {}).get("login")
-                    pr_author = f"@{pr_author_login}" if pr_author_login else "Unknown"
-
-                    return {
-                        "pr_number": pr_number,
-                        "pr_body": pr_body,
-                        "pr_author": pr_author,
-                        "commit_author": commit_author,
-                        "co_authors": co_authors
-                    }
-
-            # If no PR found, return just commit information
-            return {
-                "pr_number": None,
-                "pr_body": None,
-                "pr_author": None,
-                "commit_author": commit_author,
-                "co_authors": co_authors
-            }
+        # If no PR found, return just commit information
+        return {
+            "pr_number": None,
+            "pr_body": None,
+            "pr_author": None,
+            "commit_author": commit_author,
+            "co_authors": co_authors,
+        }
 
     except requests.exceptions.RequestException as e:
         print(f"Error fetching data from GitHub: {e}")
@@ -205,13 +318,16 @@ def generate_release_notes(changeset_text, repository="saleor/saleor-dashboard")
                 contributors = []
 
                 # Add commit author
-                if pr_info['commit_author'] and pr_info['commit_author'] != "Unknown":
-                    contributors.append(pr_info['commit_author'])
+                if pr_info["commit_author"] and pr_info["commit_author"] != "Unknown":
+                    contributors.append(pr_info["commit_author"])
 
                 # Add PR author if different from commit author
-                if (pr_info["pr_author"] and pr_info["pr_author"] != "Unknown" and
-                    pr_info["pr_author"] != pr_info["commit_author"]):
-                    contributors.append(pr_info['pr_author'])
+                if (
+                    pr_info["pr_author"]
+                    and pr_info["pr_author"] != "Unknown"
+                    and pr_info["pr_author"] != pr_info["commit_author"]
+                ):
+                    contributors.append(pr_info["pr_author"])
 
                 # Add co-authors
                 contributors.extend(pr_info["co_authors"])
@@ -223,7 +339,9 @@ def generate_release_notes(changeset_text, repository="saleor/saleor-dashboard")
                         unique_contributors.append(contributor)
 
                 if unique_contributors:
-                    release_notes += "Contributors: " + ", ".join(unique_contributors) + "\n"
+                    release_notes += (
+                        "Contributors: " + ", ".join(unique_contributors) + "\n"
+                    )
 
                 # Add PR body if available
                 if pr_info["pr_body"]:
@@ -241,23 +359,36 @@ def main():
     # Initialize environment
     setup()
 
-    parser = argparse.ArgumentParser(description='Generate release notes based on changeset.')
-    parser.add_argument('-i', '--input', type=str, help='Input file containing changeset text')
-    parser.add_argument('-o', '--output', type=str, help='Output file for the release notes')
-    parser.add_argument('-r', '--repo', type=str, default='saleor/saleor-dashboard',
-                      help='GitHub repository in format "owner/repo"')
+    parser = argparse.ArgumentParser(
+        description="Generate release notes based on changeset."
+    )
+    parser.add_argument(
+        "-i", "--input", type=str, help="Input file containing changeset text"
+    )
+    parser.add_argument(
+        "-o", "--output", type=str, help="Output file for the release notes"
+    )
+    parser.add_argument(
+        "-r",
+        "--repo",
+        type=str,
+        default="saleor/saleor-dashboard",
+        help='GitHub repository in format "owner/repo"',
+    )
     args = parser.parse_args()
 
     # Get changeset text from input file or stdin
     if args.input:
         try:
-            with open(args.input, 'r') as f:
+            with open(args.input, "r") as f:
                 changeset_text = f.read()
         except IOError as e:
             print(f"Error reading input file: {e}")
             sys.exit(1)
     else:
-        print("Please paste your changeset text (press Ctrl+D on Unix/Mac or Ctrl+Z then Enter on Windows when done):")
+        print(
+            "Please paste your changeset text (press Ctrl+D on Unix/Mac or Ctrl+Z then Enter on Windows when done):"
+        )
         changeset_text = sys.stdin.read()
 
     if not changeset_text.strip():
@@ -270,7 +401,7 @@ def main():
     # Output release notes to file or stdout
     if args.output:
         try:
-            with open(args.output, 'w') as f:
+            with open(args.output, "w") as f:
                 f.write(release_notes)
             print(f"Release notes written to {args.output}")
         except IOError as e:
